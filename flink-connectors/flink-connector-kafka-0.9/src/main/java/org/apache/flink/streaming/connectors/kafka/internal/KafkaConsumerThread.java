@@ -22,6 +22,7 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.shaded.guava18.com.google.common.collect.ImmutableMap;
 import org.apache.flink.streaming.connectors.kafka.internals.ClosableBlockingQueue;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaCommitCallback;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartitionState;
@@ -42,9 +43,12 @@ import javax.annotation.Nonnull;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -175,6 +179,7 @@ public class KafkaConsumerThread extends Thread {
 			return;
 		}
 
+		Set<MetricName> manualRegisteredMetricSet = null;
 		// from here on, the consumer is guaranteed to be closed properly
 		try {
 			// register Kafka's very own metrics in Flink's metric reporters
@@ -185,6 +190,7 @@ public class KafkaConsumerThread extends Thread {
 					// MapR's Kafka implementation returns null here.
 					log.info("Consumer implementation does not support metrics");
 				} else {
+					manualRegisteredMetricSet = new HashSet<>();
 					// we have Kafka metrics, register them
 					for (Map.Entry<MetricName, ? extends Metric> metric: metrics.entrySet()) {
 						consumerMetricGroup.gauge(metric.getKey().name(), new KafkaMetricWrapper(metric.getValue()));
@@ -209,6 +215,9 @@ public class KafkaConsumerThread extends Thread {
 			// they are carried across via re-adding them to the unassigned partitions queue
 			List<KafkaTopicPartitionState<TopicPartition>> newPartitions;
 
+			// client-id is private in KafkaConsumer, so we need to get it from the one of the metric tag.
+			// We should find a better way.
+			String clientId = consumer.metrics().entrySet().iterator().next().getKey().tags().get("client-id");
 			// main fetch loop
 			while (running) {
 
@@ -241,6 +250,16 @@ public class KafkaConsumerThread extends Thread {
 					}
 					if (newPartitions != null) {
 						reassignPartitions(newPartitions);
+						if (manualRegisteredMetricSet != null) {
+							for (KafkaTopicPartitionState<TopicPartition> tp : newPartitions) {
+								manualRegisteredMetricSet.add(
+										new MetricName(tp.getKafkaPartitionHandle().topic() + "-" +
+												tp.getKafkaPartitionHandle().partition() + ".records-lag",
+												"consumer-fetch-manager-metrics",
+												"The latest lag of the partition",
+												ImmutableMap.of("client-id", clientId)));
+							}
+						}
 					}
 				} catch (AbortedReassignmentException e) {
 					continue;
@@ -258,6 +277,17 @@ public class KafkaConsumerThread extends Thread {
 					}
 					catch (WakeupException we) {
 						continue;
+					}
+				}
+
+				if (manualRegisteredMetricSet != null && manualRegisteredMetricSet.size() > 0) {
+					for (Iterator<MetricName> i = manualRegisteredMetricSet.iterator(); i.hasNext(); ) {
+						MetricName metricName = i.next();
+						if (consumer.metrics().containsKey(metricName)) {
+							consumerMetricGroup.gauge(metricName.name(),
+									new KafkaMetricWrapper(consumer.metrics().get(metricName)));
+							i.remove();
+						}
 					}
 				}
 
